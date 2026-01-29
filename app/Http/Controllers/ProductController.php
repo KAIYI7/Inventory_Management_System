@@ -1,0 +1,392 @@
+<?php
+// Author: Ho Jie Han
+namespace App\Http\Controllers;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use Illuminate\Support\Str;
+use App\Models\Product;
+use App\Models\ProductCategory;
+use App\Factories\Products\ProductFactory;
+use Illuminate\Support\Facades\DB;
+use App\Services\StockService;
+use App\Services\BranchService;
+use App\Services\OrderService;
+
+class ProductController extends Controller
+{
+    public function __construct()
+    {
+        $this->middleware('auth');
+        $this->middleware('permission:manage_products')->except(['index', 'show']);
+    }
+
+    public function index(Request $request)
+    {
+        // Products & Categories are OWNED by Product module -> OK to query directly
+        $query = Product::with('category')
+            ->when($request->filled('status'), function ($q) use ($request) {
+                // support both is_active or status column
+                if (\Schema::hasColumn('products', 'is_active')) {
+                    $q->where('is_active', $request->status === 'active' ? 1 : 0);
+                } elseif (\Schema::hasColumn('products', 'status')) {
+                    $q->where('status', $request->status);
+                } else {
+                    $q->where('is_active', 1);
+                }
+            }, function ($q) {
+                // default: active only
+                if (\Schema::hasColumn('products', 'is_active')) {
+                    $q->where('is_active', 1);
+                } elseif (\Schema::hasColumn('products', 'status')) {
+                    $q->where('status', 'active');
+                }
+            })
+            ->when($request->category, function ($q, $category) {
+                $q->whereHas('category', fn($cat) => $cat->where('slug', $category));
+            })
+            ->when($request->search, function ($q, $search) {
+                $q->where(function ($sub) use ($search) {
+                    $sub->where('name', 'like', "%{$search}%")
+                        ->orWhere('model', 'like', "%{$search}%")
+                        ->orWhere('sku', 'like', "%{$search}%");
+                });
+            })
+            ->orderBy('name');
+
+        $products   = $query->paginate(10)->withQueryString();
+        $categories = ProductCategory::orderBy('name')->get();
+
+        return view('products.index', compact('products', 'categories'));
+    }
+
+    public function create()
+    {
+        $categories = ProductCategory::orderBy('name')->get();
+
+        // Discover available product factories (still local)
+        $factories = collect();
+        $path = app_path('Factories/Products');
+        if (\Illuminate\Support\Facades\File::exists($path)) {
+            foreach (\Illuminate\Support\Facades\File::files($path) as $file) {
+                $base = $file->getBasename('.php');
+                if ($file->getExtension() === 'php' && str_ends_with($base, 'Factory') && $base !== 'ProductFactory') {
+                    $factories->push($base);
+                }
+            }
+        }
+
+        return view('products.create', compact('categories', 'factories'));
+    }
+
+    public function store(Request $request, BranchService $branchesApi, StockService $stockApi)
+    {
+        $validated = $request->validate([
+            'name'           => 'required|string|max:255|unique:products,name',
+            'model'          => 'required|string|unique:products,model',
+            'sku'            => 'required|string|unique:products,sku',
+            'category_id'    => 'required|exists:product_categories,id',
+            'cost_price'     => 'required|numeric|min:0',
+            'selling_price'  => 'required|numeric|gt:cost_price',
+            'description'    => 'nullable|string',
+            'specifications' => 'nullable',
+            'factory_class'  => 'nullable|string',
+        ]);
+
+        try {
+            $product = null;
+            $minThreshold = 10;
+
+            DB::transaction(function () use ($validated, &$product) {
+                $category = ProductCategory::findOrFail($validated['category_id']);
+
+                // Carry the category’s default threshold outward (if present)
+                if (property_exists($category, 'default_minimum_threshold') && $category->default_minimum_threshold !== null) {
+                    $minThreshold = (int) $category->default_minimum_threshold;
+                }
+                
+                // Resolve factory: user-selected or category-mapped
+                $factory = null;
+                if (!empty($validated['factory_class'])) {
+                    $fqcn = "App\\Factories\\Products\\{$validated['factory_class']}";
+                    if (class_exists($fqcn)) {
+                        $instance = new $fqcn();
+                        if ($instance instanceof ProductFactory) {
+                            $factory = $instance;
+                        }
+                    }
+                }
+                if (!$factory) {
+                    $factory = $category->getFactoryInstance();
+                }
+
+
+                // Normalize specifications safely
+                $specs = [];
+                if (!empty($validated['specifications'])) {
+                    if (is_string($validated['specifications'])) {
+                        $decoded = json_decode($validated['specifications'], true);
+                        if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                            $specs = $decoded;
+                        } else {
+                            // invalid JSON -> keep empty array
+                            $specs = [];
+                        }
+                    } elseif (is_array($validated['specifications'])) {
+                        $specs = $validated['specifications'];
+                    }
+                }
+                
+                $data = [
+                    'name'           => $validated['name'],
+                    'model'          => $validated['model'],
+                    'sku'            => $validated['sku'],
+                    'category_id'    => $validated['category_id'],
+                    'cost_price'     => round((float)$validated['cost_price'], 2),
+                    'selling_price'  => round((float)$validated['selling_price'], 2),
+                    'description'    => $validated['description'] ?? '',
+                    'specifications' => $specs,  
+                ];
+
+                if (\Schema::hasColumn('products', 'is_active')) {
+                    $data['is_active'] = true;
+                } elseif (\Schema::hasColumn('products', 'status')) {
+                    $data['status'] = 'active';
+                }
+                
+                $product = $factory->createProduct($data);
+            });
+
+            try {
+                $branches = $branchesApi->listActive(); // [{id,name,status}, ...]
+            } catch (\Throwable $e) {
+                $branches = [];
+            }
+
+            foreach ($branches as $b) {
+                try {
+                    $stockApi->upsert((int)$b['id'], (int)$product->id, 0, $minThreshold, true); // quantity=0, keep existing
+                } catch (\Throwable $e) {
+                    // may log this, but don't block product creation (So currently, don't log first - by Jie Han)
+                    // \Log::warning('Stock upsert failed', ['branch_id'=>$b['id'],'product_id'=>$product->id,'err'=>$e->getMessage()]);
+                }
+            }
+
+            return redirect()->route('products.show', $product)
+                ->with('success', 'Product created successfully');
+        } catch (\Throwable $e) {
+            return back()->withInput()
+                ->withErrors(['error' => 'Failed to create product: ' . $e->getMessage()]);
+        }
+    }
+
+    public function show(Product $product, StockService $stockApi)
+    {
+        // Categories belong to Product module -> OK to eager-load
+        $product->load('category');
+
+        // Get per-branch availability via REST (no DB join to stocks/branches)
+        try {
+            $availability = $stockApi->availability((int)$product->id, null); // include all branches
+        } catch (\Throwable $e) {
+            $availability = []; // view can show a “unavailable” note
+        }
+
+        return view('products.show', compact('product', 'availability'));
+    }
+
+    public function edit(Product $product)
+    {
+        $categories = ProductCategory::orderBy('name')->get();
+        return view('products.edit', compact('product', 'categories'));
+    }
+
+    public function update(Request $request, Product $product)
+    {
+        $validated = $request->validate([
+            'name'                   => 'required|string|max:255',
+            'category_id'            => 'required|exists:product_categories,id',
+            'cost_price'             => 'required|numeric|min:0',
+            'selling_price'          => 'required|numeric|gt:cost_price',
+            'description'            => 'nullable|string',
+            // accept either JSON string OR key/value arrays from the form
+            'specifications'         => 'nullable',
+            'specifications.key'     => 'nullable|array',
+            'specifications.value'   => 'nullable|array',
+            'specifications.key.*'   => 'nullable|string',
+            'specifications.value.*' => 'nullable|string',
+            'is_active'              => 'nullable|boolean',
+            'status'                 => 'nullable|string|in:active,inactive',
+        ]);
+
+        try {
+            // Normalize specs
+            $specs = [];
+            if (isset($validated['specifications'])) {
+                if (is_array($validated['specifications']) && isset($validated['specifications']['key'])) {
+                    foreach ($validated['specifications']['key'] as $i => $k) {
+                        $v = $validated['specifications']['value'][$i] ?? null;
+                        if ($k !== null && $k !== '' && $v !== null) {
+                            $specs[$k] = $v;
+                        }
+                    }
+                } elseif (is_string($validated['specifications'])) {
+                    $decoded = json_decode($validated['specifications'], true);
+                    if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                        $specs = $decoded;
+                    }
+                }
+            }
+
+            $product->name          = $validated['name'];
+            $product->category_id   = (int)$validated['category_id'];
+            $product->cost_price    = round((float)$validated['cost_price'], 2);
+            $product->selling_price = round((float)$validated['selling_price'], 2);
+            $product->description   = $validated['description'] ?? '';
+            $product->specifications= $specs;
+
+            // keep compatibility with either column
+            if (array_key_exists('is_active', $validated) && \Schema::hasColumn('products', 'is_active')) {
+                $product->is_active = (bool)$validated['is_active'];
+            }
+            if (array_key_exists('status', $validated) && \Schema::hasColumn('products', 'status')) {
+                $product->status = $validated['status'];
+            }
+
+            $product->save();
+
+            return redirect()->route('products.show', $product)
+                ->with('success', 'Product updated successfully.');
+        } catch (\Throwable $e) {
+            return back()->withInput()
+                ->withErrors(['error' => 'Failed to update product: ' . $e->getMessage()]);
+        }
+    }
+
+    public function destroy(Product $product, StockService $stockApi, BranchService $branchesApi, OrderService $orderApi)
+    {
+            // 1) Who is main?
+        try {
+            $mainId = $branchesApi->mainBranchId();
+        } catch (\Throwable $e) {
+            return back()->withErrors(['error' => 'Cannot determine main branch; aborting.']);
+        }
+
+        // 2) Get current availability for this product
+        try {
+            $avail = collect($stockApi->availability((int)$product->id, null));
+        } catch (\Throwable $e) {
+            return back()->withErrors(['error' => 'Stock service unavailable; cannot validate deletion.']);
+        }
+
+        // Qty currently outside main
+        $outsideQty = (int) $avail
+            ->filter(fn ($r) => (int)$r['branch_id'] !== $mainId)
+            ->sum('available_quantity');
+
+        // Nothing to move? Deactivate now.
+        if ($outsideQty === 0) {
+            \DB::transaction(function () use ($product) {
+                if (\Schema::hasColumn('products', 'is_active')) {
+                    $product->update(['is_active' => false]);
+                } elseif (\Schema::hasColumn('products', 'status')) {
+                    $product->update(['status' => 'inactive']);
+                }
+            });
+            return redirect()->route('products.index')
+                ->with('success', 'Product deactivated successfully.');
+        }
+
+        // 3) Return from each non-main branch
+        $errors = [];
+
+        foreach ($avail as $row) {
+            $fromId = (int) $row['branch_id'];
+            if ($fromId === $mainId) continue;
+
+            // Fresh read to avoid races
+            try {
+                $fresh = collect($stockApi->availability((int)$product->id, null))
+                    ->firstWhere('branch_id', $fromId);
+            } catch (\Throwable $e) {
+                $fresh = $row;
+            }
+
+            $qty = (int) ($fresh['available_quantity'] ?? 0);
+            if ($qty <= 0) continue;
+
+            try {
+                $resp = $orderApi->createReturn(
+                    toBranchId:   $mainId,
+                    fromBranchId: $fromId,
+                    items: [[
+                        'product_id' => (int) $product->id,
+                        'quantity'   => $qty,
+                        'unit_price' => (float) ($product->selling_price ?? 0),
+                    ]],
+                    notes: 'Auto return before product deactivation',
+                    createdBy: auth()->id(),
+                    autoComplete: true
+                );
+                \Log::info('Auto-return OK', ['product_id'=>$product->id,'from'=>$fromId,'resp'=>$resp]);
+            } catch (\Throwable $e) {
+                \Log::error('Auto-return failed', ['product_id'=>$product->id,'from'=>$fromId,'err'=>$e->getMessage()]);
+                $errors[] = "Branch {$fromId}: ".$e->getMessage();
+            }
+        }
+
+        if (!empty($errors)) {
+            return back()->withErrors(['error' => 'Some returns failed: '.implode(' | ', $errors)]);
+        }
+
+        // 4) Poll: wait until outside-main hits zero (handles tiny lag)
+        $remainingOutside = -1;
+        for ($i = 0; $i < 12; $i++) { // up to ~3s
+            usleep(250_000);
+            try {
+                $remainingOutside = (int) collect($stockApi->availability((int)$product->id, null))
+                    ->filter(fn ($r) => (int)$r['branch_id'] !== $mainId)
+                    ->sum('available_quantity');
+                if ($remainingOutside === 0) break;
+            } catch (\Throwable $e) { /* ignore and retry */ }
+        }
+        if ($remainingOutside > 0) {
+            return back()->withErrors(['error' =>
+                "Auto-return finished but {$remainingOutside} units remain outside the main branch."
+            ]);
+        }
+
+        // 5) Deactivate locally
+        \DB::transaction(function () use ($product) {
+            if (\Schema::hasColumn('products', 'is_active')) {
+                $product->update(['is_active' => false]);
+            } elseif (\Schema::hasColumn('products', 'status')) {
+                $product->update(['status' => 'inactive']);
+            }
+        });
+
+        return redirect()->route('products.index')
+            ->with('success', 'Product removed. Stock returned to main branch.');
+
+        
+    }
+
+    // Add Category with auto-slug (local to Product module)
+    public function storeCategory(Request $request)
+    {
+        $validated = $request->validate([
+            'name'         => 'required|string|max:255|unique:product_categories,name',
+            'description'  => 'nullable|string',
+        ]);
+
+        ProductCategory::create([
+            'name'         => $validated['name'],
+            'slug'         => Str::slug($validated['name']),
+            'description'  => $validated['description'] ?? null,
+            'status'       => 'active',
+        ]);
+
+        return redirect()->route('products.index')
+            ->with('success', 'Category added successfully');
+    }
+}
