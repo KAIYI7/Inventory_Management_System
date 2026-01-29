@@ -1,4 +1,41 @@
-## 🚀 Quick Start
+# Inventory Management System — Modular Integration via REST APIs (Laravel)
+
+This project is a Laravel-based inventory and inter-branch ordering system.  
+It simulates a modular / microservice-style architecture where different modules exchange data through **RESTful APIs** (instead of direct database access).
+
+## Tech Stack
+- **PHP 8.2**, **Laravel 12**
+- **MySQL** (recommended for local run)
+- **Laravel UI** (auth scaffolding)
+- **Laravel Sanctum** (API auth capability)
+- **HTTP Client** (`Http::...`) for inter-module API calls
+- **Spatie Media Library** (media/file management)
+- Design Patterns used:
+  - **Strategy Pattern** (urgent vs standard order rules)
+  - **Factory Pattern** (product creation by category)
+- Scheduler/Command:
+  - Auto-approve overdue urgent orders (`orders:auto-approve-urgent`)
+
+## Main Modules / Concepts
+- Users
+- Branches
+- Products & Categories
+- Stock (availability, reserve, release, receive)
+- Orders (create, approve, ship, receive, cancel)
+- Stock movements + stock value reporting
+
+## REST API Endpoints (examples)
+- `/api/users/*`
+- `/api/branches/*`
+- `/api/products/*`
+- `/api/stock/availability`, `/api/stock/reserve`, `/api/stock/release`, `/api/stock/receive`
+- `/api/orders/*` and transitions:
+  - `/api/orders/{id}/approve`
+  - `/api/orders/{id}/ship`
+  - `/api/orders/{id}/receive`
+  - `/api/orders/{id}/cancel`
+
+## Quick Start
 
 Follow these steps to set up the project locally:
 
