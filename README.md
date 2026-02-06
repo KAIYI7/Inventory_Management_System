@@ -129,5 +129,4 @@ Follow these steps to set up the project locally:
 
 To ensure the scheduled tasks (`orders:auto-approve-urgent`) run as expected, use the following command:
 
-```bash
 php artisan schedule:work
