@@ -118,12 +118,9 @@ Follow these steps to set up the project locally:
 
    In your `.env` file, ensure that the following **service URLs** are correctly set with the appropriate ports:
 
-   ```env
-   USERS_SERVICE_BASE_URL=http://127.0.0.1:8001
-   STOCK_SERVICE_BASE_URL=http://127.0.0.1:8001
-   ORDERS_SERVICE_BASE_URL=http://127.0.0.1:8002
-   PRODUCTS_SERVICE_BASE_URL=http://127.0.0.1:8001
-   BRANCHES_SERVICE_BASE_URL=http://127.0.0.1:8001
+USERS_SERVICE_BASE_URL=http://127.0.0.1:8001
+STOCK_SERVICE_BASE_URL=http://127.0.0.1:8001
+ORDERS_SERVICE_BASE_URL=http://127.0.0.1:8002  PRODUCTS_SERVICE_BASE_URL=http://127.0.0.1:8001   BRANCHES_SERVICE_BASE_URL=http://127.0.0.1:8001
 
 13. **Running the Laravel Scheduler**
 
